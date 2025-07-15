@@ -1,4 +1,4 @@
-name: Deploy to Amazon ECR
+name: Trigger Build & Push on EC2
 
 on:
   push:
@@ -6,14 +6,10 @@ on:
       - main
 
 jobs:
-  build-and-push:
-    name: Build and Push to ECR
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -21,15 +17,36 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Build, tag, and push image to Amazon ECR
+      - name: Trigger EC2 build & push
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          REPO_URL: ${{ secrets.REPO_URL }}
+          APP_DIR: "/home/ubuntu/app"
+          IMAGE_TAG: "${{ github.sha }}"
+          ECR_REGISTRY: "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          ECR_REPOSITORY: "${{ secrets.ECR_REPOSITORY }}"
+          AWS_REGION: "${{ secrets.AWS_REGION }}"
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          COMMANDS=$(cat <<EOF
+          [
+            "sudo apt-get update && sudo apt-get install -y docker.io awscli git",
+            "sudo systemctl start docker",
+            "sudo systemctl enable docker",
+            "if [ ! -d $APP_DIR ]; then git clone $REPO_URL $APP_DIR; else cd $APP_DIR && git pull; fi",
+            "cd $APP_DIR",
+            "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+            "docker build -t $ECR_REPOSITORY:$IMAGE_TAG .",
+            "docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG",
+            "docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          ]
+          EOF
+          )
+
+          aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Build and push Docker image to ECR from EC2" \
+            --parameters commands="$COMMANDS"
+
+          echo "✅ Trigger sent to EC2 instance."
